@@ -1,0 +1,105 @@
+# Job Application Tracker
+
+A backend service for tracking job applications, with resume uploads, follow-up reminders, and event-driven notifications.
+
+## What it does
+
+Users add jobs they've applied to, upload resumes, and get follow-up reminders. The system nudges them when an application has gone stale (e.g., "It's been 7 days since you applied to X — send a follow-up?").
+
+## Architecture
+
+| Concern | Tech | Purpose |
+|---|---|---|
+| Auth | JWT | Stateless session tokens for API access |
+| Primary DB | Postgres | Stores `users`, `applications`, `companies`, `contacts`, `resumes` |
+| Event bus | Kafka | Topics: `application.created`, `interview.scheduled`, `status.changed`. Consumers: email, analytics, notifications |
+| Cache / rate limit | Redis | Caches dashboard view; rate-limits login attempts |
+| Scheduler | Cron | Daily job scans stale applications and emits follow-up events |
+| File storage | S3-compatible | Resume uploads (PDF/DOCX) |
+
+## Data model (initial)
+
+- `users` — id, email, password_hash, created_at
+- `companies` — id, name, website, notes
+- `applications` — id, user_id, company_id, role, status, applied_at, last_followed_up_at
+- `contacts` — id, company_id, name, email, role
+- `resumes` — id, user_id, s3_key, uploaded_at
+- `events` (audit) — id, type, payload, occurred_at
+
+## Event topics
+
+- `application.created` — emitted on POST /applications
+- `status.changed` — emitted when application status updates (applied → interview → offer/rejected)
+- `interview.scheduled` — emitted when an interview date is set
+- `followup.due` — emitted by the daily cron when application is stale
+
+## Work breakdown
+
+Steps are ordered so each builds on the last. Don't skip ahead — later steps assume earlier ones exist.
+
+### Stack (decided)
+- **Runtime:** Node.js + TypeScript
+- **Framework:** Express
+- **Target:** local dev only via docker-compose (defer cloud)
+
+### Step 1 — Project scaffold
+- `npm init`, install Express + TypeScript + ts-node-dev, ESLint, Prettier, Jest (or vitest).
+- `tsconfig.json` with strict mode on.
+- Directory layout: `src/{routes,services,db,events,middleware,jobs,config}`, `tests/`, `migrations/`.
+- `.env.example` with placeholders for `DATABASE_URL`, `JWT_SECRET`, `REDIS_URL`, `KAFKA_BROKERS`, `S3_*`.
+- `docker-compose.yml` running Postgres, Redis, Kafka (KRaft mode — simpler than Zookeeper), MinIO for S3, and Mailpit for local email.
+
+### Step 2 — Database layer
+- Pick migration tool (e.g., `node-pg-migrate`, `prisma`, `golang-migrate`).
+- Write migrations for the tables in **Data model** above.
+- Seed script with a couple of demo users + applications for local dev.
+
+### Step 3 — Auth (JWT)
+- `POST /auth/register` — hash password (bcrypt/argon2), insert user.
+- `POST /auth/login` — verify password, issue JWT (short-lived access + refresh).
+- `middleware/auth` — verifies JWT on protected routes, attaches `req.user`.
+- Redis-backed rate limit on `/auth/login` (e.g., 5 attempts / 15 min per IP+email).
+
+### Step 4 — Core CRUD
+- `POST/GET/PATCH/DELETE /applications` (scoped to authenticated user).
+- `POST/GET /companies`, `POST/GET /contacts`.
+- Validation (zod / joi / struct tags).
+- Pagination + filters on list endpoints (status, company, applied_at range).
+
+### Step 5 — Resume uploads
+- `POST /resumes` — multipart upload, store in S3/minio, persist `s3_key`.
+- `GET /resumes/:id` — pre-signed download URL.
+- Enforce per-user storage quota and file type/size limits.
+
+### Step 6 — Kafka event bus
+- Producer wrapper. Emit `application.created` and `status.changed` from the CRUD handlers.
+- Consumer skeletons for `email-service`, `analytics-service`, `notification-service` (start as stubs that log).
+- Wire `interview.scheduled` when an interview date is added.
+
+### Step 7 — Cron + follow-up reminders
+- Daily job: find applications where `status = 'applied'` AND `last_followed_up_at` is null or > 7 days old.
+- For each, emit `followup.due` on Kafka.
+- `email-service` consumer renders the reminder and sends via SES/SMTP (use mailpit/mailhog locally).
+- On user response or status change, update `last_followed_up_at`.
+
+### Step 8 — Dashboard + caching
+- `GET /dashboard` — aggregates: counts by status, recent activity, upcoming follow-ups.
+- Cache the response in Redis per-user with a short TTL (e.g., 60s). Invalidate on `status.changed`.
+
+### Step 9 — Observability + hardening
+- Structured logging with request IDs.
+- Health/readiness endpoints.
+- Basic metrics (request count, latency, Kafka lag, cron last-run timestamp).
+- Error handling middleware that doesn't leak stack traces.
+
+### Step 10 — Tests
+- Unit tests for auth, validation, cron logic.
+- Integration tests hitting real Postgres + Redis + Kafka via docker-compose.
+- A small e2e flow: register → create application → trigger cron → assert `followup.due` event was produced.
+
+## Conventions
+
+- Keep handlers thin; put business logic in service modules.
+- Producers emit events *after* the DB transaction commits (avoid phantom events on rollback).
+- All times stored as UTC in Postgres.
+- Never log JWTs, passwords, or full resume contents.
