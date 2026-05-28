@@ -1,5 +1,8 @@
 import express, { Request, Response } from 'express';
 import authRouter from './routes/auth';
+import applicationsRouter from './routes/applications';
+import companiesRouter from './routes/companies';
+import contactsRouter from './routes/contacts';
 import { errorHandler } from './middleware/errorHandler';
 
 export function createApp() {
@@ -12,6 +15,9 @@ export function createApp() {
   });
 
   app.use('/auth', authRouter);
+  app.use('/applications', applicationsRouter);
+  app.use('/companies', companiesRouter);
+  app.use('/contacts', contactsRouter);
 
   // Error handler must be the last middleware.
   app.use(errorHandler);
