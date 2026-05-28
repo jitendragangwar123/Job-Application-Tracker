@@ -4,7 +4,7 @@ A backend service for tracking job applications, with resume uploads, follow-up 
 
 Users add jobs they've applied to, upload resumes, and get follow-up reminders. The system nudges them when an application has gone stale (e.g., "It's been 7 days since you applied to X — send a follow-up?").
 
-> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 2 — DB layer).
+> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 4 — Core CRUD).
 
 ---
 
@@ -186,6 +186,370 @@ docker compose down -v         # stop AND wipe all volumes (fresh slate)
 
 ---
 
+## API reference
+
+Base URL: `http://localhost:3000`
+
+All request/response bodies are JSON (`Content-Type: application/json`). Endpoints marked **🔒 Auth** require `Authorization: Bearer <accessToken>`.
+
+### Error shape
+
+Every error response uses this format:
+
+```json
+{ "error": { "code": "UNAUTHORIZED", "message": "Invalid credentials" } }
+```
+
+| Code | HTTP | When |
+|---|---|---|
+| `INVALID_INPUT` | 400 | Validation failed (zod) or referenced FK doesn't exist |
+| `UNAUTHORIZED` | 401 | Missing/invalid/expired token, or bad credentials |
+| `FORBIDDEN` | 403 | Authenticated but not allowed |
+| `NOT_FOUND` | 404 | Resource doesn't exist (or isn't yours) |
+| `CONFLICT` | 409 | Duplicate (e.g., email already registered) |
+| `RATE_LIMITED` | 429 | Too many requests — see `Retry-After` header |
+| `INTERNAL` | 500 | Unexpected — check server logs |
+
+---
+
+### Auth
+
+#### `POST /auth/register`
+
+Create a new user and immediately receive a token pair.
+
+**Body**
+```json
+{
+  "email": "you@example.com",
+  "password": "correct-horse-battery"
+}
+```
+
+**Constraints**
+- `email` — valid email, ≤ 254 chars
+- `password` — 8–128 chars
+
+**Response `201`**
+```json
+{
+  "user": { "id": "8f3e...e7", "email": "you@example.com" },
+  "tokens": {
+    "accessToken": "eyJhbGciOi...",
+    "refreshToken": "eyJhbGciOi..."
+  }
+}
+```
+
+**Errors:** `400 INVALID_INPUT`, `409 CONFLICT` (email exists)
+
+---
+
+#### `POST /auth/login`
+
+Exchange credentials for a fresh token pair. Rate-limited to **5 attempts per email per 15 minutes**.
+
+**Body** — same shape as register.
+
+**Response `200`** — same shape as register, with status `200`.
+
+**Errors:** `400 INVALID_INPUT`, `401 UNAUTHORIZED` (wrong email or password — same message either way), `429 RATE_LIMITED`
+
+Response headers on every login attempt: `X-RateLimit-Limit`, `X-RateLimit-Remaining`. On 429: `Retry-After: <seconds>`.
+
+---
+
+#### `POST /auth/refresh`
+
+Swap a refresh token for a new pair.
+
+**Body**
+```json
+{ "refreshToken": "eyJhbGciOi..." }
+```
+
+**Response `200`**
+```json
+{
+  "tokens": {
+    "accessToken": "eyJhbGciOi...",
+    "refreshToken": "eyJhbGciOi..."
+  }
+}
+```
+
+**Errors:** `400 INVALID_INPUT`, `401 UNAUTHORIZED` (invalid/expired token, or access token sent instead of refresh)
+
+---
+
+#### `GET /auth/me`   🔒 Auth
+
+Return the currently authenticated user.
+
+**Response `200`**
+```json
+{ "user": { "id": "8f3e...e7", "email": "you@example.com" } }
+```
+
+**Errors:** `401 UNAUTHORIZED`
+
+---
+
+### Applications   🔒 Auth (user-scoped)
+
+Every application belongs to the authenticated user. You can only see/modify your own.
+
+`ApplicationStatus` is one of: `APPLIED`, `INTERVIEW`, `OFFER`, `REJECTED`, `WITHDRAWN`. Default on create: `APPLIED`.
+
+#### `POST /applications`
+
+**Body**
+```json
+{
+  "companyId": "0b3e7d2c-...-uuid",
+  "role": "Senior Backend Engineer",
+  "status": "APPLIED",
+  "appliedAt": "2026-05-20T12:00:00Z",
+  "notes": "Referred by a friend"
+}
+```
+
+**Constraints**
+- `companyId` — UUID of an existing company (else `400 INVALID_INPUT`)
+- `role` — 1–200 chars
+- `status` — optional, defaults to `APPLIED`
+- `appliedAt` — ISO-8601, optional, defaults to now
+- `notes` — optional, ≤ 10,000 chars
+
+**Response `201`**
+```json
+{
+  "id": "ab12...",
+  "userId": "8f3e...",
+  "companyId": "0b3e...",
+  "role": "Senior Backend Engineer",
+  "status": "APPLIED",
+  "appliedAt": "2026-05-20T12:00:00.000Z",
+  "lastFollowedUpAt": null,
+  "notes": "Referred by a friend",
+  "createdAt": "2026-05-26T...",
+  "updatedAt": "2026-05-26T..."
+}
+```
+
+---
+
+#### `GET /applications`
+
+List the caller's applications with optional filters. Ordered by `appliedAt desc`.
+
+**Query params** (all optional)
+
+| Param | Type | Notes |
+|---|---|---|
+| `status` | enum | One of `APPLIED`, `INTERVIEW`, `OFFER`, `REJECTED`, `WITHDRAWN` |
+| `companyId` | UUID | Filter to a single company |
+| `appliedFrom` | ISO date | Inclusive lower bound on `appliedAt` |
+| `appliedTo` | ISO date | Inclusive upper bound on `appliedAt` |
+| `limit` | int (1–100) | Default `20` |
+| `offset` | int (≥0) | Default `0` |
+
+**Example**
+```
+GET /applications?status=APPLIED&appliedFrom=2026-05-01&limit=10
+```
+
+**Response `200`**
+```json
+{
+  "items": [
+    { "id": "ab12...", "role": "Senior Backend Engineer", "status": "APPLIED", "...": "..." }
+  ],
+  "pagination": { "limit": 10, "offset": 0, "total": 1 }
+}
+```
+
+---
+
+#### `GET /applications/:id`
+
+**Response `200`** — the application object.
+
+**Errors:** `404 NOT_FOUND` (also if it exists but belongs to another user — by design)
+
+---
+
+#### `PATCH /applications/:id`
+
+Partial update. Send only the fields you want to change.
+
+**Body** (all fields optional, must send at least one)
+```json
+{
+  "status": "INTERVIEW",
+  "lastFollowedUpAt": "2026-05-26T09:00:00Z",
+  "notes": "Phone screen scheduled for next Tuesday"
+}
+```
+
+Allowed fields: `role`, `status`, `appliedAt`, `lastFollowedUpAt` (nullable), `notes` (nullable).
+`companyId` is **not** updatable — delete and recreate if you applied under the wrong company.
+
+**Response `200`** — the updated application.
+
+**Errors:** `400 INVALID_INPUT` (empty body or invalid value), `404 NOT_FOUND`
+
+---
+
+#### `DELETE /applications/:id`
+
+Hard delete.
+
+**Response `204`** — no content.
+
+**Errors:** `404 NOT_FOUND`
+
+---
+
+### Companies   🔒 Auth (global scope)
+
+Companies are shared across all users.
+
+#### `POST /companies`
+
+**Body**
+```json
+{
+  "name": "Acme Corp",
+  "website": "https://acme.example",
+  "notes": "Series B, ~200 people"
+}
+```
+
+**Constraints**
+- `name` — 1–200 chars, required
+- `website` — valid URL, ≤ 500 chars, optional
+- `notes` — ≤ 10,000 chars, optional
+
+**Response `201`** — the created company.
+
+---
+
+#### `GET /companies`
+
+List companies, optionally filtered by name. Ordered by `name asc`.
+
+**Query params**
+
+| Param | Type | Notes |
+|---|---|---|
+| `name` | string | Case-insensitive *contains* match |
+| `limit` | int (1–100) | Default `20` |
+| `offset` | int (≥0) | Default `0` |
+
+**Example**
+```
+GET /companies?name=acme
+```
+
+**Response `200`**
+```json
+{
+  "items": [
+    { "id": "0b3e...", "name": "Acme Corp", "website": "https://acme.example", "notes": null, "createdAt": "..." }
+  ],
+  "pagination": { "limit": 20, "offset": 0, "total": 1 }
+}
+```
+
+---
+
+#### `GET /companies/:id`
+
+Returns the company with its full contact list included.
+
+**Response `200`**
+```json
+{
+  "id": "0b3e...",
+  "name": "Acme Corp",
+  "website": "https://acme.example",
+  "notes": null,
+  "createdAt": "...",
+  "contacts": [
+    { "id": "...", "name": "Jane Recruiter", "email": "jane@acme.example", "role": "Recruiter" }
+  ]
+}
+```
+
+**Errors:** `404 NOT_FOUND`
+
+---
+
+### Contacts   🔒 Auth (global scope)
+
+#### `POST /contacts`
+
+**Body**
+```json
+{
+  "companyId": "0b3e7d2c-...-uuid",
+  "name": "Jane Recruiter",
+  "email": "jane@acme.example",
+  "role": "Recruiter"
+}
+```
+
+**Constraints**
+- `companyId` — UUID of existing company (else `400 INVALID_INPUT`)
+- `name` — 1–200 chars, required
+- `email` — valid email, optional
+- `role` — ≤ 200 chars, optional
+
+**Response `201`** — the created contact.
+
+---
+
+#### `GET /contacts`
+
+List contacts, optionally filtered by company. Ordered by `name asc`.
+
+**Query params**
+
+| Param | Type | Notes |
+|---|---|---|
+| `companyId` | UUID | Filter to a single company |
+| `limit` | int (1–100) | Default `20` |
+| `offset` | int (≥0) | Default `0` |
+
+**Example**
+```
+GET /contacts?companyId=0b3e7d2c-...
+```
+
+**Response `200`** — paginated list shape (same as the others).
+
+---
+
+### End-to-end Postman flow
+
+A typical session covering everything above:
+
+```
+1. POST /auth/register   → save accessToken + refreshToken as env vars
+2. POST /companies       → body {"name":"Acme"} → save id as companyId
+3. POST /contacts        → body {"companyId":"{{companyId}}","name":"Jane"}
+4. POST /applications    → body {"companyId":"{{companyId}}","role":"Backend Engineer"}
+5. GET  /applications?status=APPLIED
+6. PATCH /applications/:id → body {"status":"INTERVIEW"}
+7. GET  /auth/me
+8. POST /auth/refresh    → save the new token pair
+```
+
+See [Step 4 — Postman setup](#) in the docs above for a Postman **Tests** snippet that auto-captures `accessToken` and `refreshToken` after register/login/refresh.
+
+---
+
 ## Project layout
 
 ```
@@ -198,15 +562,35 @@ job-application-tracker/
 │   └── seed.ts                 # demo data
 ├── src/
 │   ├── index.ts                # boot + graceful shutdown
-│   ├── app.ts                  # Express app factory + /health
-│   ├── config/                 # env loader
-│   ├── db/                     # Prisma Client singleton
-│   ├── routes/                 # (Step 3+) auth, applications, resumes...
-│   ├── services/               # (Step 3+) business logic
-│   ├── middleware/             # (Step 3+) auth, rate-limit, error handler
+│   ├── app.ts                  # Express app factory + route mounts
+│   ├── config/
+│   │   └── env.ts              # env loader + validation
+│   ├── db/
+│   │   ├── prisma.ts           # Prisma Client singleton
+│   │   └── redis.ts            # ioredis singleton
+│   ├── routes/
+│   │   ├── auth.ts             # /auth/register, /login, /refresh, /me
+│   │   ├── applications.ts     # /applications CRUD
+│   │   ├── companies.ts        # /companies (POST, GET)
+│   │   ├── contacts.ts         # /contacts (POST, GET)
+│   │   └── pagination.ts       # shared zod schemas + list shape
+│   ├── services/
+│   │   ├── auth.ts             # register/login/refresh logic
+│   │   ├── password.ts         # bcrypt hash/verify
+│   │   ├── jwt.ts              # sign/verify access + refresh tokens
+│   │   ├── applications.ts     # application business logic
+│   │   ├── companies.ts        # company business logic
+│   │   ├── contacts.ts         # contact business logic
+│   │   └── errors.ts           # AppError + Errors factory
+│   ├── middleware/
+│   │   ├── auth.ts             # requireAuth (verify Bearer JWT)
+│   │   ├── rateLimit.ts        # Redis-backed fixed-window limiter
+│   │   └── errorHandler.ts     # JSON error response (zod + AppError)
 │   ├── events/                 # (Step 6) Kafka producers/consumers
 │   └── jobs/                   # (Step 7) cron jobs
 └── tests/
+    ├── health.test.ts
+    └── auth.test.ts            # register/login/me/refresh + rate limit
 ```
 
 ---
@@ -217,9 +601,9 @@ job-application-tracker/
 |---|---|
 | 1. Project scaffold | ✅ done |
 | 2. Database layer (Prisma + migrations + seed) | ✅ done |
-| 3. Auth (JWT + Redis rate limit) | ⏳ next |
-| 4. Core CRUD (applications, companies, contacts) | — |
-| 5. Resume uploads (MinIO) | — |
+| 3. Auth (JWT + Redis rate limit) | ✅ done |
+| 4. Core CRUD (applications, companies, contacts) | ✅ done |
+| 5. Resume uploads (MinIO) | ⏳ next |
 | 6. Kafka event bus | — |
 | 7. Cron + follow-up reminders | — |
 | 8. Dashboard + Redis cache | — |
