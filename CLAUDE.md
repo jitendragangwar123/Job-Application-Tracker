@@ -99,6 +99,82 @@ Steps are ordered so each builds on the last. Don't skip ahead — later steps a
 - Integration tests hitting real Postgres + Redis + Kafka via docker-compose.
 - A small e2e flow: register → create application → trigger cron → assert `followup.due` event was produced.
 
+---
+
+## Phase 2 — Frontend (Next.js)
+
+Once the backend (Steps 1–10) is complete, layer a Next.js UI on top. The frontend lives at `web/` in this repo (sibling to `src/`), runs on port `3001`, and talks to the existing API on port `3000`.
+
+### Frontend stack (proposed — confirm at F1)
+- **Next.js 15+** (App Router, TypeScript, `src/` dir)
+- **Tailwind CSS** for styling
+- **shadcn/ui** — copy-paste accessible primitives (button, input, dialog, table) built on Radix
+- **TanStack Query** for server-state fetching/caching/revalidation
+- **react-hook-form + zod** for forms (same shapes as the backend's zod schemas where possible)
+- **Token storage:** decision at F2 — httpOnly cookie set via a Next.js Route Handler (more secure) vs. localStorage (simpler)
+
+### F1 — Scaffold the Next.js app
+- `npx create-next-app@latest web --typescript --tailwind --app --eslint --src-dir`
+- `web/.env.local` → `NEXT_PUBLIC_API_URL=http://localhost:3000`
+- Install: `@tanstack/react-query`, `react-hook-form`, `zod`, `@hookform/resolvers`, `lucide-react` (icons)
+- Initialize shadcn/ui: `npx shadcn@latest init`
+- Update root README with how to run frontend + backend together
+- Optionally add npm workspaces (`package.json` workspaces) so a single `npm install` covers both
+
+### F2 — API client + auth handling
+- `web/src/lib/api/client.ts` — fetch wrapper that:
+  - Prefixes `NEXT_PUBLIC_API_URL`
+  - Injects `Authorization: Bearer <accessToken>`
+  - On `401`, attempts `POST /auth/refresh` once and retries the original request
+  - Maps the backend's error shape `{error:{code,message}}` to a typed `ApiError`
+- `web/src/lib/auth/AuthProvider.tsx` — React context exposing `user`, `login()`, `register()`, `logout()`, `refresh()`
+- Token storage: pick httpOnly cookie (Route Handler proxies all API calls) **or** localStorage. Default recommendation: localStorage for the MVP, with a note to migrate to cookies before production.
+
+### F3 — Auth pages (`/login`, `/register`)
+- react-hook-form + zod, matching the backend's password constraints (8–128 chars, valid email ≤254 chars)
+- Inline field errors + a form-level banner for `{error.message}`
+- On success: redirect to `/applications`
+- Link between login ↔ register
+
+### F4 — Authenticated layout + nav
+- `web/src/app/(authed)/layout.tsx` — sidebar nav: **Applications**, **Companies**, **Resumes**, **Dashboard**
+- Auth guard middleware (or layout-level redirect): if no token, send to `/login`
+- User menu in the header with email + logout
+
+### F5 — Applications: list + detail
+- `/applications` — paginated table with:
+  - Status filter (dropdown of the enum), company filter (picker), `appliedFrom`/`appliedTo` date range
+  - Color-coded status badges
+  - Sortable by `appliedAt` (desc default)
+- `/applications/[id]` — read view, inline edit for `status`, `notes`, `lastFollowedUpAt`, delete with confirm dialog
+- Use TanStack Query for caching + revalidation; optimistic updates on PATCH
+
+### F6 — Applications: create
+- `/applications/new` — form with **company typeahead** (queries `GET /companies?name=`)
+- Inline "Create company" affordance when no match — opens a sub-form and POSTs to `/companies`, then auto-selects it
+- On submit: `POST /applications` then redirect to the new detail page
+
+### F7 — Companies + contacts
+- `/companies` — searchable list + "Add company" button
+- `/companies/[id]` — detail with contact list + "Add contact" form
+- All forms use the same react-hook-form + zod pattern
+
+### F8 — Resumes (depends on backend Step 5)
+- `/resumes` — list current resumes with metadata (filename, size, uploaded date) + download links via pre-signed URL
+- Upload form: client requests pre-signed PUT URL from backend, uploads directly to MinIO, then registers the resume record
+
+### F9 — Dashboard home (depends on backend Step 8)
+- `/` (when logged in) — status counts cards, recent activity feed, **stale applications** panel surfacing what the daily cron flagged
+- Hits `GET /dashboard` for an aggregated payload (TanStack Query with a longer stale time since the backend caches it in Redis)
+
+### F10 — Polish + frontend tests
+- Toast notifications (success / error)
+- Empty states, loading skeletons, global error boundary
+- 404 page, mobile-responsive sweep
+- Tests: a few component/page tests with **Vitest + Testing Library**, plus one **Playwright E2E**: register → create company → create application → patch status → delete
+
+---
+
 ## Conventions
 
 - Keep handlers thin; put business logic in service modules.
