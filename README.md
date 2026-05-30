@@ -4,7 +4,7 @@ A backend service for tracking job applications, with resume uploads, follow-up 
 
 Users add jobs they've applied to, upload resumes, and get follow-up reminders. The system nudges them when an application has gone stale (e.g., "It's been 7 days since you applied to X — send a follow-up?").
 
-> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 7 — Cron + follow-up reminders).
+> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 8 — Dashboard + Redis cache).
 
 ---
 
@@ -633,6 +633,75 @@ Removes the metadata row and the object in MinIO.
 
 ---
 
+### Dashboard   🔒 Auth (user-scoped)
+
+A single aggregated view of the caller's data. The response is **cached in Redis for 60 seconds per user**, and invalidated automatically when any application-related event fires (creation, status change, interview scheduled, follow-up due) via the `cache-invalidator` Kafka consumer.
+
+#### `GET /dashboard`
+
+**Response `200`**
+```json
+{
+  "counts": {
+    "byStatus": {
+      "APPLIED": 2,
+      "INTERVIEW": 1,
+      "OFFER": 0,
+      "REJECTED": 1,
+      "WITHDRAWN": 0
+    },
+    "total": 4
+  },
+  "recentApplications": [
+    {
+      "id": "...",
+      "role": "Offer Role",
+      "status": "REJECTED",
+      "appliedAt": "2026-05-30T...",
+      "lastFollowedUpAt": null,
+      "updatedAt": "2026-05-30T20:01:33.451Z",
+      "company": { "id": "...", "name": "Dashboard Test Co" }
+    }
+  ],
+  "upcomingFollowups": [
+    {
+      "id": "...",
+      "role": "Stale Backend",
+      "status": "APPLIED",
+      "appliedAt": "2026-05-20T...",
+      "lastFollowedUpAt": null,
+      "updatedAt": "...",
+      "company": { "id": "...", "name": "Dashboard Test Co" }
+    }
+  ],
+  "generatedAt": "2026-05-30T20:01:34.012Z"
+}
+```
+
+**Fields**
+- `counts.byStatus` — count of the caller's applications in each `ApplicationStatus`. Always zero-filled — every enum key is present.
+- `counts.total` — sum of the above.
+- `recentApplications` — last 5 applications by `updatedAt desc`. Includes the nested `company` summary.
+- `upcomingFollowups` — up to 5 stale `APPLIED` applications the cron would currently flag (i.e., last interaction older than `FOLLOWUP_REMINDER_DAYS`).
+- `generatedAt` — when the cached snapshot was produced (handy for "data as of …" UI).
+
+**Response headers**
+
+| Header | Value | When |
+|---|---|---|
+| `X-Cache` | `HIT` | The response came from Redis |
+| `X-Cache` | `MISS` | Cache was empty/stale — Postgres was queried and the result re-cached |
+
+**Errors:** `401 UNAUTHORIZED`
+
+**Cache lifecycle in a nutshell**
+- TTL: 60s
+- Key: `dashboard:<userId>` in Redis
+- Invalidated immediately when the caller's user is the `actor` on a Kafka event of type `application.created`, `status.changed`, `interview.scheduled`, or `followup.due`
+- If you ever want to force a refresh from outside: `docker exec jobtracker-redis redis-cli DEL dashboard:<userId>`
+
+---
+
 ### Jobs   🔒 Auth
 
 Background jobs that normally run on a schedule, exposed via HTTP for manual triggering.
@@ -688,9 +757,12 @@ A typical session covering everything above:
 8.  GET  /resumes/{{resumeId}}   → grab downloadUrl, open in browser to verify
 9.  POST /jobs/followup-scan
                                   ↳ emits followup.due, sends email — check Mailpit UI at :8025
-10. GET  /auth/me
-11. POST /auth/refresh    → save the new token pair
-12. DELETE /resumes/{{resumeId}} → cleanup
+10. GET  /dashboard       → see counts + recent + upcoming (X-Cache: MISS first time, HIT next)
+11. PATCH /applications/:id → body {"status":"OFFER"}
+                                  ↳ cache-invalidator drops dashboard:<userId>; next /dashboard is MISS again
+12. GET  /auth/me
+13. POST /auth/refresh    → save the new token pair
+14. DELETE /resumes/{{resumeId}} → cleanup
 ```
 
 See [Step 4 — Postman setup](#) in the docs above for a Postman **Tests** snippet that auto-captures `accessToken` and `refreshToken` after register/login/refresh.
@@ -723,6 +795,7 @@ job-application-tracker/
 │   │   ├── contacts.ts         # /contacts (POST, GET)
 │   │   ├── resumes.ts          # /resumes (POST upload, GET list, GET, DELETE)
 │   │   ├── jobs.ts             # POST /jobs/followup-scan (manual cron trigger)
+│   │   ├── dashboard.ts        # GET /dashboard (Redis read-through cache)
 │   │   └── pagination.ts       # shared zod schemas + list shape
 │   ├── services/
 │   │   ├── auth.ts             # register/login/refresh logic
@@ -733,6 +806,8 @@ job-application-tracker/
 │   │   ├── contacts.ts         # contact business logic
 │   │   ├── resumes.ts          # upload (with quota), list, get + signed URL, delete
 │   │   ├── mail.ts             # nodemailer SMTP singleton + sendMail()
+│   │   ├── cache.ts            # Redis JSON get/set/del + dashboardCacheKey()
+│   │   ├── dashboard.ts        # computeDashboard(userId) — counts + recent + upcoming
 │   │   └── errors.ts           # AppError + Errors factory
 │   ├── middleware/
 │   │   ├── auth.ts             # requireAuth (verify Bearer JWT)
@@ -746,7 +821,8 @@ job-application-tracker/
 │   │   └── consumers/
 │   │       ├── email.ts        # renders + sends follow-up email; logs others
 │   │       ├── analytics.ts    # persists every event to the events table
-│   │       └── notifications.ts # stub (logs status.changed + interview.scheduled)
+│   │       ├── notifications.ts # stub (logs status.changed + interview.scheduled)
+│   │       └── cacheInvalidator.ts # DELs dashboard:<userId> on relevant events
 │   └── jobs/
 │       ├── followupScan.ts     # scan stale APPLIED apps + emit followup.due
 │       └── index.ts            # node-cron schedule (09:00 UTC daily)
@@ -768,6 +844,6 @@ job-application-tracker/
 | 5. Resume uploads (MinIO) | ✅ done |
 | 6. Kafka event bus | ✅ done |
 | 7. Cron + follow-up reminders | ✅ done |
-| 8. Dashboard + Redis cache | ⏳ next |
-| 9. Observability + hardening | — |
+| 8. Dashboard + Redis cache | ✅ done |
+| 9. Observability + hardening | ⏳ next |
 | 10. Tests (unit + integration + e2e) | — |

@@ -17,6 +17,9 @@ export const kafka =
     brokers: env.kafka.brokers,
     logLevel: env.nodeEnv === 'production' ? logLevel.WARN : logLevel.ERROR,
     retry: { retries: 5, initialRetryTime: 300 },
+    // 5s tolerates the first TCP handshake under Docker/macOS, which can
+    // exceed the kafkajs default of 1s on cold start.
+    connectionTimeout: 5000,
   });
 
 let producer: Producer | undefined = global.__producer;
