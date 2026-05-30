@@ -4,7 +4,7 @@ A backend service for tracking job applications, with resume uploads, follow-up 
 
 Users add jobs they've applied to, upload resumes, and get follow-up reminders. The system nudges them when an application has gone stale (e.g., "It's been 7 days since you applied to X — send a follow-up?").
 
-> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 5 — Resume uploads).
+> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 7 — Cron + follow-up reminders).
 
 ---
 
@@ -633,6 +633,44 @@ Removes the metadata row and the object in MinIO.
 
 ---
 
+### Jobs   🔒 Auth
+
+Background jobs that normally run on a schedule, exposed via HTTP for manual triggering.
+
+A `node-cron` task fires **`runFollowupScan()` every day at `09:00 UTC`** automatically. The endpoint below exists so you can run it on demand (useful for testing or kicking off a scan after data import).
+
+#### `POST /jobs/followup-scan`
+
+Scans all applications across the system where `status = 'APPLIED'` and either:
+- `lastFollowedUpAt` is set but older than `FOLLOWUP_REMINDER_DAYS` (default **7**), or
+- `lastFollowedUpAt` is `null` and `appliedAt` is older than that threshold.
+
+For each match, the server:
+1. Publishes a `followup.due` event to Kafka (rich payload: application + company + userEmail + days)
+2. Sets `lastFollowedUpAt = now()` so the next scan won't re-fire until the window elapses again
+3. The `email-service` consumer renders + sends a reminder email via SMTP (Mailpit locally)
+
+**Body** — none. Auth is the only requirement.
+
+**Response `200`**
+```json
+{
+  "scanned": 1,
+  "applicationIds": ["5d2c3fa9-d292-4bf8-bb53-a3981a8a0377"]
+}
+```
+
+**Effects you can verify**
+- `applications.last_followed_up_at` advances on each matched row
+- `events` table gets a new `followup.due` row (the analytics consumer writes it)
+- Email lands in Mailpit at http://localhost:8025
+
+**Idempotency.** Re-running the scan immediately returns `scanned: 0` — applications won't be re-flagged for another `FOLLOWUP_REMINDER_DAYS`.
+
+**Errors:** `401 UNAUTHORIZED`
+
+---
+
 ### End-to-end Postman flow
 
 A typical session covering everything above:
@@ -641,14 +679,18 @@ A typical session covering everything above:
 1.  POST /auth/register   → save accessToken + refreshToken as env vars
 2.  POST /companies       → body {"name":"Acme"} → save id as companyId
 3.  POST /contacts        → body {"companyId":"{{companyId}}","name":"Jane"}
-4.  POST /applications    → body {"companyId":"{{companyId}}","role":"Backend Engineer"}
+4.  POST /applications    → body {"companyId":"{{companyId}}","role":"Backend Engineer",
+                                  "appliedAt":"2026-05-15T00:00:00Z"}    ← old date = scan candidate
 5.  GET  /applications?status=APPLIED
 6.  PATCH /applications/:id → body {"status":"INTERVIEW"}
+                                  ↳ emits status.changed + interview.scheduled to Kafka
 7.  POST /resumes         → form-data, field "file" = pick a .pdf  → save id as resumeId
 8.  GET  /resumes/{{resumeId}}   → grab downloadUrl, open in browser to verify
-9.  GET  /auth/me
-10. POST /auth/refresh    → save the new token pair
-11. DELETE /resumes/{{resumeId}} → cleanup
+9.  POST /jobs/followup-scan
+                                  ↳ emits followup.due, sends email — check Mailpit UI at :8025
+10. GET  /auth/me
+11. POST /auth/refresh    → save the new token pair
+12. DELETE /resumes/{{resumeId}} → cleanup
 ```
 
 See [Step 4 — Postman setup](#) in the docs above for a Postman **Tests** snippet that auto-captures `accessToken` and `refreshToken` after register/login/refresh.
@@ -676,27 +718,38 @@ job-application-tracker/
 │   │   └── s3.ts               # S3 client (MinIO) + ensureBucket/put/delete/signed-URL helpers
 │   ├── routes/
 │   │   ├── auth.ts             # /auth/register, /login, /refresh, /me
-│   │   ├── applications.ts     # /applications CRUD
+│   │   ├── applications.ts     # /applications CRUD (emits Kafka events)
 │   │   ├── companies.ts        # /companies (POST, GET)
 │   │   ├── contacts.ts         # /contacts (POST, GET)
 │   │   ├── resumes.ts          # /resumes (POST upload, GET list, GET, DELETE)
+│   │   ├── jobs.ts             # POST /jobs/followup-scan (manual cron trigger)
 │   │   └── pagination.ts       # shared zod schemas + list shape
 │   ├── services/
 │   │   ├── auth.ts             # register/login/refresh logic
 │   │   ├── password.ts         # bcrypt hash/verify
 │   │   ├── jwt.ts              # sign/verify access + refresh tokens
-│   │   ├── applications.ts     # application business logic
+│   │   ├── applications.ts     # application business logic + event emits
 │   │   ├── companies.ts        # company business logic
 │   │   ├── contacts.ts         # contact business logic
 │   │   ├── resumes.ts          # upload (with quota), list, get + signed URL, delete
+│   │   ├── mail.ts             # nodemailer SMTP singleton + sendMail()
 │   │   └── errors.ts           # AppError + Errors factory
 │   ├── middleware/
 │   │   ├── auth.ts             # requireAuth (verify Bearer JWT)
 │   │   ├── rateLimit.ts        # Redis-backed fixed-window limiter
 │   │   ├── upload.ts           # multer config + MIME/size limits
 │   │   └── errorHandler.ts     # JSON error response (zod + AppError)
-│   ├── events/                 # (Step 6) Kafka producers/consumers
-│   └── jobs/                   # (Step 7) cron jobs
+│   ├── events/
+│   │   ├── types.ts            # Topic constants + per-event payload types
+│   │   ├── kafka.ts            # idempotent producer, ensureTopics, publishEvent
+│   │   ├── index.ts            # startEvents / stopEvents lifecycle
+│   │   └── consumers/
+│   │       ├── email.ts        # renders + sends follow-up email; logs others
+│   │       ├── analytics.ts    # persists every event to the events table
+│   │       └── notifications.ts # stub (logs status.changed + interview.scheduled)
+│   └── jobs/
+│       ├── followupScan.ts     # scan stale APPLIED apps + emit followup.due
+│       └── index.ts            # node-cron schedule (09:00 UTC daily)
 └── tests/
     ├── health.test.ts
     └── auth.test.ts            # register/login/me/refresh + rate limit
@@ -713,8 +766,8 @@ job-application-tracker/
 | 3. Auth (JWT + Redis rate limit) | ✅ done |
 | 4. Core CRUD (applications, companies, contacts) | ✅ done |
 | 5. Resume uploads (MinIO) | ✅ done |
-| 6. Kafka event bus | ⏳ next |
-| 7. Cron + follow-up reminders | — |
-| 8. Dashboard + Redis cache | — |
+| 6. Kafka event bus | ✅ done |
+| 7. Cron + follow-up reminders | ✅ done |
+| 8. Dashboard + Redis cache | ⏳ next |
 | 9. Observability + hardening | — |
 | 10. Tests (unit + integration + e2e) | — |
