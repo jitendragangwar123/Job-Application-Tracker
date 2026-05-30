@@ -3,6 +3,7 @@ import { connectProducer, disconnectProducer, ensureTopics } from './kafka';
 import { startEmailConsumer } from './consumers/email';
 import { startAnalyticsConsumer } from './consumers/analytics';
 import { startNotificationsConsumer } from './consumers/notifications';
+import { startCacheInvalidator } from './consumers/cacheInvalidator';
 
 let consumers: Consumer[] = [];
 
@@ -13,6 +14,7 @@ export async function startEvents(): Promise<void> {
     startEmailConsumer(),
     startAnalyticsConsumer(),
     startNotificationsConsumer(),
+    startCacheInvalidator(),
   ]);
   // eslint-disable-next-line no-console
   console.log(`[events] producer + ${consumers.length} consumers ready`);
