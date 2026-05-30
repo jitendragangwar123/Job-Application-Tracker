@@ -1,6 +1,8 @@
 import { ApplicationStatus, Prisma } from '@prisma/client';
 import { prisma } from '../db/prisma';
 import { Errors } from './errors';
+import { publishEvent } from '../events';
+import { Topics } from '../events/types';
 
 export interface CreateApplicationInput {
   companyId: string;
@@ -25,6 +27,13 @@ export interface ListApplicationsFilters {
   appliedTo?: Date;
 }
 
+function emit<T extends Parameters<typeof publishEvent>[0]>(input: T): void {
+  publishEvent(input).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error('[events] publish failed', input.type, err);
+  });
+}
+
 export async function createApplication(userId: string, input: CreateApplicationInput) {
   const company = await prisma.company.findUnique({
     where: { id: input.companyId },
@@ -32,7 +41,7 @@ export async function createApplication(userId: string, input: CreateApplication
   });
   if (!company) throw Errors.invalidInput(`Company ${input.companyId} does not exist`);
 
-  return prisma.application.create({
+  const app = await prisma.application.create({
     data: {
       userId,
       companyId: input.companyId,
@@ -42,6 +51,14 @@ export async function createApplication(userId: string, input: CreateApplication
       notes: input.notes,
     },
   });
+
+  emit({
+    type: Topics.ApplicationCreated,
+    actor: { userId },
+    data: { application: app },
+  });
+
+  return app;
 }
 
 export async function listApplications(
@@ -83,14 +100,13 @@ export async function updateApplication(
   id: string,
   input: UpdateApplicationInput,
 ) {
-  // Ensure ownership before update (findFirst by id+userId).
   const existing = await prisma.application.findFirst({
     where: { id, userId },
-    select: { id: true },
+    select: { id: true, status: true },
   });
   if (!existing) throw Errors.notFound('Application not found');
 
-  return prisma.application.update({
+  const app = await prisma.application.update({
     where: { id },
     data: {
       ...(input.role !== undefined && { role: input.role }),
@@ -100,6 +116,23 @@ export async function updateApplication(
       ...(input.notes !== undefined && { notes: input.notes }),
     },
   });
+
+  if (input.status !== undefined && input.status !== existing.status) {
+    emit({
+      type: Topics.StatusChanged,
+      actor: { userId },
+      data: { application: app, from: existing.status, to: input.status },
+    });
+    if (input.status === ApplicationStatus.INTERVIEW) {
+      emit({
+        type: Topics.InterviewScheduled,
+        actor: { userId },
+        data: { application: app },
+      });
+    }
+  }
+
+  return app;
 }
 
 export async function deleteApplication(userId: string, id: string): Promise<void> {

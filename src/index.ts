@@ -3,9 +3,11 @@ import { env } from './config/env';
 import { prisma } from './db/prisma';
 import { redis } from './db/redis';
 import { ensureBucket } from './db/s3';
+import { startEvents, stopEvents } from './events';
 
 async function main(): Promise<void> {
   await ensureBucket();
+  await startEvents();
 
   const app = createApp();
 
@@ -18,6 +20,7 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(`[job-tracker] received ${signal}, shutting down`);
     server.close();
+    await stopEvents();
     await Promise.allSettled([prisma.$disconnect(), redis.quit()]);
     process.exit(0);
   }

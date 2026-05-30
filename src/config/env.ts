@@ -32,4 +32,12 @@ export const env = {
     secretKey: required('S3_SECRET_KEY'),
     forcePathStyle: required('S3_FORCE_PATH_STYLE', 'true') === 'true',
   },
+
+  kafka: {
+    brokers: required('KAFKA_BROKERS')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+    clientId: required('KAFKA_CLIENT_ID', 'job-tracker'),
+  },
 };
