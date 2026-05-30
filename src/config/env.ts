@@ -23,4 +23,13 @@ export const env = {
   },
 
   bcryptCost: Number(required('BCRYPT_COST', '12')),
+
+  s3: {
+    endpoint: required('S3_ENDPOINT'),
+    region: required('S3_REGION', 'us-east-1'),
+    bucket: required('S3_BUCKET'),
+    accessKey: required('S3_ACCESS_KEY'),
+    secretKey: required('S3_SECRET_KEY'),
+    forcePathStyle: required('S3_FORCE_PATH_STYLE', 'true') === 'true',
+  },
 };

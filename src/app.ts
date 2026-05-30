@@ -3,6 +3,7 @@ import authRouter from './routes/auth';
 import applicationsRouter from './routes/applications';
 import companiesRouter from './routes/companies';
 import contactsRouter from './routes/contacts';
+import resumesRouter from './routes/resumes';
 import { errorHandler } from './middleware/errorHandler';
 
 export function createApp() {
@@ -18,6 +19,7 @@ export function createApp() {
   app.use('/applications', applicationsRouter);
   app.use('/companies', companiesRouter);
   app.use('/contacts', contactsRouter);
+  app.use('/resumes', resumesRouter);
 
   // Error handler must be the last middleware.
   app.use(errorHandler);

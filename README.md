@@ -4,7 +4,7 @@ A backend service for tracking job applications, with resume uploads, follow-up 
 
 Users add jobs they've applied to, upload resumes, and get follow-up reminders. The system nudges them when an application has gone stale (e.g., "It's been 7 days since you applied to X — send a follow-up?").
 
-> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 4 — Core CRUD).
+> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 5 — Resume uploads).
 
 ---
 
@@ -531,19 +531,124 @@ GET /contacts?companyId=0b3e7d2c-...
 
 ---
 
+### Resumes   🔒 Auth (user-scoped)
+
+Resumes are uploaded as **multipart/form-data** (no JSON body for `POST /resumes`).
+
+**Limits**
+- File size: **5 MB max** per file
+- Per-user storage: **50 MB total**
+- Accepted MIME types: `application/pdf`, `application/msword`, `application/vnd.openxmlformats-officedocument.wordprocessingml.document` (i.e., PDF/DOC/DOCX)
+
+#### `POST /resumes`
+
+Upload a resume. Stored in MinIO; metadata persisted in Postgres.
+
+**Headers**
+
+| Key | Value |
+|---|---|
+| `Authorization` | `Bearer <accessToken>` |
+| `Content-Type` | `multipart/form-data` (Postman sets the boundary automatically) |
+
+**Body** (form-data)
+
+| Key | Type | Value |
+|---|---|---|
+| `file` | **File** | The resume PDF/DOC/DOCX. The field name must be exactly `file`. |
+
+**Response `201`**
+```json
+{
+  "id": "5cb13990-d900-4436-a876-30a753f02e70",
+  "filename": "resume.pdf",
+  "sizeBytes": 321,
+  "uploadedAt": "2026-05-28T20:48:05.838Z"
+}
+```
+
+**Errors**
+- `400 INVALID_INPUT` — missing `file` field, unsupported MIME type, file too large, or quota exceeded (response message indicates which)
+- `401 UNAUTHORIZED`
+
+---
+
+#### `GET /resumes`
+
+List the caller's resumes. Ordered by `uploadedAt desc`.
+
+**Query params**
+
+| Param | Type | Notes |
+|---|---|---|
+| `limit` | int (1–100) | Default `20` |
+| `offset` | int (≥0) | Default `0` |
+
+**Response `200`**
+```json
+{
+  "items": [
+    {
+      "id": "5cb13990-...",
+      "filename": "resume.pdf",
+      "sizeBytes": 321,
+      "uploadedAt": "2026-05-28T20:48:05.838Z"
+    }
+  ],
+  "pagination": { "limit": 20, "offset": 0, "total": 1 }
+}
+```
+
+---
+
+#### `GET /resumes/:id`
+
+Returns the resume metadata plus a **pre-signed download URL** (valid for 15 minutes). The URL points directly at MinIO; the browser/curl can fetch it without any auth header, but it expires.
+
+**Response `200`**
+```json
+{
+  "id": "5cb13990-...",
+  "filename": "resume.pdf",
+  "sizeBytes": 321,
+  "uploadedAt": "2026-05-28T20:48:05.838Z",
+  "downloadUrl": "http://localhost:9000/resumes/users/.../resume-id.pdf?X-Amz-Algorithm=...",
+  "downloadUrlExpiresIn": 900
+}
+```
+
+Open `downloadUrl` in a browser or `curl -O "$URL"` to download the file. Content-Disposition is set so it saves with the original filename.
+
+**Errors:** `404 NOT_FOUND` (also returned if the resume exists but belongs to another user)
+
+---
+
+#### `DELETE /resumes/:id`
+
+Removes the metadata row and the object in MinIO.
+
+**Response `204`** — no content.
+
+**Errors:** `404 NOT_FOUND`
+
+---
+
 ### End-to-end Postman flow
 
 A typical session covering everything above:
 
 ```
-1. POST /auth/register   → save accessToken + refreshToken as env vars
-2. POST /companies       → body {"name":"Acme"} → save id as companyId
-3. POST /contacts        → body {"companyId":"{{companyId}}","name":"Jane"}
-4. POST /applications    → body {"companyId":"{{companyId}}","role":"Backend Engineer"}
-5. GET  /applications?status=APPLIED
-6. PATCH /applications/:id → body {"status":"INTERVIEW"}
-7. GET  /auth/me
-8. POST /auth/refresh    → save the new token pair
+1.  POST /auth/register   → save accessToken + refreshToken as env vars
+2.  POST /companies       → body {"name":"Acme"} → save id as companyId
+3.  POST /contacts        → body {"companyId":"{{companyId}}","name":"Jane"}
+4.  POST /applications    → body {"companyId":"{{companyId}}","role":"Backend Engineer"}
+5.  GET  /applications?status=APPLIED
+6.  PATCH /applications/:id → body {"status":"INTERVIEW"}
+7.  POST /resumes         → form-data, field "file" = pick a .pdf  → save id as resumeId
+8.  GET  /resumes/{{resumeId}}   → grab downloadUrl, open in browser to verify
+9.  GET  /auth/me
+10. POST /auth/refresh    → save the new token pair
+11. DELETE /resumes/{{resumeId}} → cleanup
 ```
 
 See [Step 4 — Postman setup](#) in the docs above for a Postman **Tests** snippet that auto-captures `accessToken` and `refreshToken` after register/login/refresh.
@@ -567,12 +672,14 @@ job-application-tracker/
 │   │   └── env.ts              # env loader + validation
 │   ├── db/
 │   │   ├── prisma.ts           # Prisma Client singleton
-│   │   └── redis.ts            # ioredis singleton
+│   │   ├── redis.ts            # ioredis singleton
+│   │   └── s3.ts               # S3 client (MinIO) + ensureBucket/put/delete/signed-URL helpers
 │   ├── routes/
 │   │   ├── auth.ts             # /auth/register, /login, /refresh, /me
 │   │   ├── applications.ts     # /applications CRUD
 │   │   ├── companies.ts        # /companies (POST, GET)
 │   │   ├── contacts.ts         # /contacts (POST, GET)
+│   │   ├── resumes.ts          # /resumes (POST upload, GET list, GET, DELETE)
 │   │   └── pagination.ts       # shared zod schemas + list shape
 │   ├── services/
 │   │   ├── auth.ts             # register/login/refresh logic
@@ -581,10 +688,12 @@ job-application-tracker/
 │   │   ├── applications.ts     # application business logic
 │   │   ├── companies.ts        # company business logic
 │   │   ├── contacts.ts         # contact business logic
+│   │   ├── resumes.ts          # upload (with quota), list, get + signed URL, delete
 │   │   └── errors.ts           # AppError + Errors factory
 │   ├── middleware/
 │   │   ├── auth.ts             # requireAuth (verify Bearer JWT)
 │   │   ├── rateLimit.ts        # Redis-backed fixed-window limiter
+│   │   ├── upload.ts           # multer config + MIME/size limits
 │   │   └── errorHandler.ts     # JSON error response (zod + AppError)
 │   ├── events/                 # (Step 6) Kafka producers/consumers
 │   └── jobs/                   # (Step 7) cron jobs
@@ -603,8 +712,8 @@ job-application-tracker/
 | 2. Database layer (Prisma + migrations + seed) | ✅ done |
 | 3. Auth (JWT + Redis rate limit) | ✅ done |
 | 4. Core CRUD (applications, companies, contacts) | ✅ done |
-| 5. Resume uploads (MinIO) | ⏳ next |
-| 6. Kafka event bus | — |
+| 5. Resume uploads (MinIO) | ✅ done |
+| 6. Kafka event bus | ⏳ next |
 | 7. Cron + follow-up reminders | — |
 | 8. Dashboard + Redis cache | — |
 | 9. Observability + hardening | — |
