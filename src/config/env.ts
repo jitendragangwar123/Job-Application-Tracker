@@ -40,4 +40,12 @@ export const env = {
       .filter(Boolean),
     clientId: required('KAFKA_CLIENT_ID', 'job-tracker'),
   },
+
+  mail: {
+    host: required('MAIL_HOST', 'localhost'),
+    port: Number(required('MAIL_PORT', '1025')),
+    from: required('MAIL_FROM', 'no-reply@jobtracker.local'),
+  },
+
+  followupReminderDays: Number(required('FOLLOWUP_REMINDER_DAYS', '7')),
 };

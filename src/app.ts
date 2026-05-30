@@ -4,6 +4,7 @@ import applicationsRouter from './routes/applications';
 import companiesRouter from './routes/companies';
 import contactsRouter from './routes/contacts';
 import resumesRouter from './routes/resumes';
+import jobsRouter from './routes/jobs';
 import { errorHandler } from './middleware/errorHandler';
 
 export function createApp() {
@@ -20,6 +21,7 @@ export function createApp() {
   app.use('/companies', companiesRouter);
   app.use('/contacts', contactsRouter);
   app.use('/resumes', resumesRouter);
+  app.use('/jobs', jobsRouter);
 
   // Error handler must be the last middleware.
   app.use(errorHandler);

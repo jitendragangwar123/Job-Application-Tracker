@@ -4,10 +4,12 @@ import { prisma } from './db/prisma';
 import { redis } from './db/redis';
 import { ensureBucket } from './db/s3';
 import { startEvents, stopEvents } from './events';
+import { startCron, stopCron } from './jobs';
 
 async function main(): Promise<void> {
   await ensureBucket();
   await startEvents();
+  startCron();
 
   const app = createApp();
 
@@ -20,6 +22,7 @@ async function main(): Promise<void> {
     // eslint-disable-next-line no-console
     console.log(`[job-tracker] received ${signal}, shutting down`);
     server.close();
+    stopCron();
     await stopEvents();
     await Promise.allSettled([prisma.$disconnect(), redis.quit()]);
     process.exit(0);

@@ -28,7 +28,9 @@ export type StatusChangedData = {
 };
 export type InterviewScheduledData = { application: Application };
 export type FollowupDueData = {
-  applicationId: string;
+  application: Application;
+  company: { id: string; name: string };
+  userEmail: string;
   daysSinceApplied: number;
 };
 
