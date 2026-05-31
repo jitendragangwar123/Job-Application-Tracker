@@ -1,8 +1,10 @@
 import type { Consumer } from 'kafkajs';
 import { kafka } from '../kafka';
 import { Topics } from '../types';
+import { logger } from '../../logger';
 
 const SUBSCRIPTIONS = [Topics.StatusChanged, Topics.InterviewScheduled];
+const log = logger.child({ consumer: 'notifications-service' });
 
 export async function startNotificationsConsumer(): Promise<Consumer> {
   const consumer = kafka.consumer({ groupId: 'notifications-service' });
@@ -11,10 +13,9 @@ export async function startNotificationsConsumer(): Promise<Consumer> {
 
   await consumer.run({
     eachMessage: async ({ topic, message }) => {
-      const payload = message.value?.toString() ?? '<empty>';
-      // Future: push notifications, in-app alerts.
-      // eslint-disable-next-line no-console
-      console.log(`[notifications-service] received ${topic}: ${payload.slice(0, 120)}…`);
+      const raw = message.value?.toString();
+      if (!raw) return;
+      log.debug({ topic, size: raw.length }, 'received event');
     },
   });
 

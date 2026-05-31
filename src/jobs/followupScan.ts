@@ -3,6 +3,7 @@ import { prisma } from '../db/prisma';
 import { publishEvent } from '../events';
 import { Topics } from '../events/types';
 import { env } from '../config/env';
+import { logger } from '../logger';
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -35,8 +36,7 @@ export async function runFollowupScan(): Promise<ScanResult> {
     },
   });
 
-  // eslint-disable-next-line no-console
-  console.log(`[jobs] followup scan found ${stale.length} stale applications`);
+  logger.info({ count: stale.length }, 'followup scan: found stale applications');
 
   const ids: string[] = [];
   for (const app of stale) {
@@ -58,8 +58,7 @@ export async function runFollowupScan(): Promise<ScanResult> {
       });
       ids.push(app.id);
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.error('[jobs] failed to emit followup.due for', app.id, err);
+      logger.error({ err, applicationId: app.id }, 'followup scan: failed to emit followup.due');
     }
   }
 

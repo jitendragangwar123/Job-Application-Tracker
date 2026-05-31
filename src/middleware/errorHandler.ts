@@ -1,15 +1,17 @@
 import type { NextFunction, Request, Response } from 'express';
 import { ZodError } from 'zod';
 import { AppError } from '../services/errors';
-import { env } from '../config/env';
+import { logger } from '../logger';
 
 export function errorHandler(
   err: unknown,
-  _req: Request,
+  req: Request,
   res: Response,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   _next: NextFunction,
 ): void {
+  const log = req.log ?? logger;
+
   if (err instanceof ZodError) {
     res.status(400).json({
       error: { code: 'INVALID_INPUT', message: 'Validation failed', details: err.issues },
@@ -18,13 +20,12 @@ export function errorHandler(
   }
 
   if (err instanceof AppError) {
+    if (err.status >= 500) log.error({ err }, err.message);
     res.status(err.status).json({ error: { code: err.code, message: err.message } });
     return;
   }
 
-  if (env.nodeEnv !== 'production' && err instanceof Error) {
-    // eslint-disable-next-line no-console
-    console.error('[unhandled]', err);
-  }
+  // Unknown — log full error server-side, return generic message to client.
+  log.error({ err }, 'unhandled error');
   res.status(500).json({ error: { code: 'INTERNAL', message: 'Internal server error' } });
 }

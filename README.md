@@ -4,7 +4,7 @@ A backend service for tracking job applications, with resume uploads, follow-up 
 
 Users add jobs they've applied to, upload resumes, and get follow-up reminders. The system nudges them when an application has gone stale (e.g., "It's been 7 days since you applied to X — send a follow-up?").
 
-> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 8 — Dashboard + Redis cache).
+> **Note:** This project is being built incrementally. See [CLAUDE.md](./CLAUDE.md) for the full step-by-step plan. The instructions below describe **what's working today** (through Step 9 — Observability + hardening).
 
 ---
 
@@ -191,6 +191,14 @@ docker compose down -v         # stop AND wipe all volumes (fresh slate)
 Base URL: `http://localhost:3000`
 
 All request/response bodies are JSON (`Content-Type: application/json`). Endpoints marked **🔒 Auth** require `Authorization: Bearer <accessToken>`.
+
+### Cross-cutting behavior (all endpoints)
+
+- **`X-Request-Id`** — every response includes one. If the request **sent** an `X-Request-Id` header, the server echoes it back unchanged; otherwise it generates a fresh UUID. Use this for log correlation: every server log line for that request includes the same ID at `req.id`.
+- **Security headers** — `helmet` is on by default. Expect `Strict-Transport-Security`, `X-Frame-Options: SAMEORIGIN`, `X-Content-Type-Options: nosniff`, a baseline CSP, etc.
+- **CORS** — dev: reflects request origin (so the Next.js frontend at `:3001` works without further config); prod: no cross-origin access until explicitly enabled.
+- **JSON body limit** — 1 MB (per request). Resume uploads use multipart and have their own per-file limit (5 MB).
+- **Error responses never leak stack traces**, even in development. Full stack is written to the server log only, correlated by `req.id`.
 
 ### Error shape
 
@@ -633,6 +641,65 @@ Removes the metadata row and the object in MinIO.
 
 ---
 
+### Observability (no auth)
+
+Endpoints intended for orchestrators (Kubernetes liveness/readiness probes), CI checks, and Prometheus scrapers. None require auth, since a load balancer or scrape job needs unauthenticated access.
+
+#### `GET /health` — liveness
+
+Returns immediately if the process is up. Does **not** check downstream dependencies, so it stays green during a transient DB blip and won't cascade-fail your orchestrator.
+
+**Response `200`**
+```json
+{ "status": "ok", "uptime": 12.345 }
+```
+
+#### `GET /ready` — readiness
+
+Runs deep health checks in parallel: Postgres `SELECT 1`, Redis `PING`, Kafka producer connection state.
+
+**Response `200`** when all dependencies are reachable:
+```json
+{
+  "status": "ready",
+  "checks": {
+    "postgres": { "ok": true, "durationMs": 38 },
+    "redis":    { "ok": true, "durationMs": 3 },
+    "kafka":    { "ok": true, "durationMs": 2 }
+  }
+}
+```
+
+**Response `503`** when any dependency fails. Same body shape with `"status": "not_ready"`, the failing check has `ok: false`, and an `error` string explains why.
+
+Use this for the readiness probe in deployment manifests so traffic gets deregistered when a backing service goes down.
+
+#### `GET /metrics` — Prometheus exposition
+
+Returns metrics in the Prometheus text format. Default Node.js metrics (event-loop lag, GC, memory, CPU) plus:
+
+| Metric | Type | Labels | Notes |
+|---|---|---|---|
+| `http_requests_total` | counter | `method`, `route`, `status` | Total HTTP requests handled |
+| `http_request_duration_seconds` | histogram | `method`, `route`, `status` | Buckets at 5ms … 5s |
+| `cron_last_run_timestamp_seconds` | gauge | `job` | Unix timestamp of the last successful run |
+
+Sample (truncated):
+```
+# HELP http_requests_total Total HTTP requests processed
+# TYPE http_requests_total counter
+http_requests_total{method="GET",route="/health",status="200"} 4
+http_requests_total{method="GET",route="/dashboard",status="200"} 1
+
+# HELP cron_last_run_timestamp_seconds Unix timestamp of the last successful run, by job name
+# TYPE cron_last_run_timestamp_seconds gauge
+cron_last_run_timestamp_seconds{job="followup_scan"} 1780176000
+```
+
+> **Heads-up:** `/metrics` is unauthenticated, which is the standard convention for Prometheus scrapers. In production, expose it on an internal-only port or restrict via network policy — don't put it behind the public-facing load balancer.
+
+---
+
 ### Dashboard   🔒 Auth (user-scoped)
 
 A single aggregated view of the caller's data. The response is **cached in Redis for 60 seconds per user**, and invalidated automatically when any application-related event fires (creation, status change, interview scheduled, follow-up due) via the `cache-invalidator` Kafka consumer.
@@ -780,8 +847,9 @@ job-application-tracker/
 │   ├── migrations/             # generated SQL migrations
 │   └── seed.ts                 # demo data
 ├── src/
-│   ├── index.ts                # boot + graceful shutdown
+│   ├── index.ts                # boot + graceful shutdown + uncaught/unhandled handlers
 │   ├── app.ts                  # Express app factory + route mounts
+│   ├── logger.ts               # pino singleton (JSON in prod, pretty in dev) + redaction
 │   ├── config/
 │   │   └── env.ts              # env loader + validation
 │   ├── db/
@@ -796,6 +864,7 @@ job-application-tracker/
 │   │   ├── resumes.ts          # /resumes (POST upload, GET list, GET, DELETE)
 │   │   ├── jobs.ts             # POST /jobs/followup-scan (manual cron trigger)
 │   │   ├── dashboard.ts        # GET /dashboard (Redis read-through cache)
+│   │   ├── observability.ts    # GET /ready (deep checks), GET /metrics (Prometheus)
 │   │   └── pagination.ts       # shared zod schemas + list shape
 │   ├── services/
 │   │   ├── auth.ts             # register/login/refresh logic
@@ -813,7 +882,9 @@ job-application-tracker/
 │   │   ├── auth.ts             # requireAuth (verify Bearer JWT)
 │   │   ├── rateLimit.ts        # Redis-backed fixed-window limiter
 │   │   ├── upload.ts           # multer config + MIME/size limits
-│   │   └── errorHandler.ts     # JSON error response (zod + AppError)
+│   │   ├── requestContext.ts   # pino-http: X-Request-Id + structured request log
+│   │   ├── metrics.ts          # prom-client HTTP counter + histogram + cron gauge
+│   │   └── errorHandler.ts     # JSON error response (zod + AppError); never leaks stack
 │   ├── events/
 │   │   ├── types.ts            # Topic constants + per-event payload types
 │   │   ├── kafka.ts            # idempotent producer, ensureTopics, publishEvent
@@ -845,5 +916,5 @@ job-application-tracker/
 | 6. Kafka event bus | ✅ done |
 | 7. Cron + follow-up reminders | ✅ done |
 | 8. Dashboard + Redis cache | ✅ done |
-| 9. Observability + hardening | ⏳ next |
-| 10. Tests (unit + integration + e2e) | — |
+| 9. Observability + hardening | ✅ done |
+| 10. Tests (unit + integration + e2e) | ⏳ next |

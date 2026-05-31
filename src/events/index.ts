@@ -4,6 +4,7 @@ import { startEmailConsumer } from './consumers/email';
 import { startAnalyticsConsumer } from './consumers/analytics';
 import { startNotificationsConsumer } from './consumers/notifications';
 import { startCacheInvalidator } from './consumers/cacheInvalidator';
+import { logger } from '../logger';
 
 let consumers: Consumer[] = [];
 
@@ -16,8 +17,7 @@ export async function startEvents(): Promise<void> {
     startNotificationsConsumer(),
     startCacheInvalidator(),
   ]);
-  // eslint-disable-next-line no-console
-  console.log(`[events] producer + ${consumers.length} consumers ready`);
+  logger.info({ consumers: consumers.length }, 'events: producer + consumers ready');
 }
 
 export async function stopEvents(): Promise<void> {

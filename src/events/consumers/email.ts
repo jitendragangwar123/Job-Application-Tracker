@@ -2,6 +2,7 @@ import type { Consumer } from 'kafkajs';
 import { kafka } from '../kafka';
 import { Topics, type FollowupDueData } from '../types';
 import { sendMail } from '../../services/mail';
+import { logger } from '../../logger';
 
 const SUBSCRIPTIONS = [
   Topics.ApplicationCreated,
@@ -9,6 +10,8 @@ const SUBSCRIPTIONS = [
   Topics.InterviewScheduled,
   Topics.FollowupDue,
 ];
+
+const log = logger.child({ consumer: 'email-service' });
 
 function renderFollowupEmail(data: FollowupDueData): {
   to: string;
@@ -50,18 +53,15 @@ export async function startEmailConsumer(): Promise<Consumer> {
           const envelope = JSON.parse(raw) as { data: FollowupDueData };
           const mail = renderFollowupEmail(envelope.data);
           await sendMail(mail);
-          // eslint-disable-next-line no-console
-          console.log(`[email-service] sent followup reminder to ${mail.to}`);
+          log.info({ to: mail.to }, 'sent followup reminder');
         } catch (err) {
-          // eslint-disable-next-line no-console
-          console.error('[email-service] failed to send followup email', err);
+          log.error({ err }, 'failed to send followup email');
         }
         return;
       }
 
-      // Other topics: stub-log for now. Step 7 only wires the followup email.
-      // eslint-disable-next-line no-console
-      console.log(`[email-service] received ${topic}: ${raw.slice(0, 120)}…`);
+      // Other topics: stub-log for now.
+      log.debug({ topic }, 'received event');
     },
   });
 

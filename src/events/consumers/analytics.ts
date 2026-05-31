@@ -2,6 +2,9 @@ import type { Consumer } from 'kafkajs';
 import { kafka } from '../kafka';
 import { ALL_TOPICS } from '../types';
 import { prisma } from '../../db/prisma';
+import { logger } from '../../logger';
+
+const log = logger.child({ consumer: 'analytics-service' });
 
 export async function startAnalyticsConsumer(): Promise<Consumer> {
   const consumer = kafka.consumer({ groupId: 'analytics-service' });
@@ -22,8 +25,7 @@ export async function startAnalyticsConsumer(): Promise<Consumer> {
           },
         });
       } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error('[analytics-service] failed to persist event', topic, err);
+        log.error({ err, topic }, 'failed to persist event');
       }
     },
   });
