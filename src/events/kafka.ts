@@ -42,6 +42,10 @@ export async function disconnectProducer(): Promise<void> {
   if (env.nodeEnv !== 'production') global.__producer = undefined;
 }
 
+export function isProducerConnected(): boolean {
+  return producer !== undefined;
+}
+
 export async function ensureTopics(): Promise<void> {
   const admin = kafka.admin();
   await admin.connect();

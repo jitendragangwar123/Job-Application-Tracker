@@ -2,6 +2,7 @@ import type { Consumer } from 'kafkajs';
 import { kafka } from '../kafka';
 import { Topics } from '../types';
 import { dashboardCacheKey, del } from '../../services/cache';
+import { logger } from '../../logger';
 
 const SUBSCRIPTIONS = [
   Topics.ApplicationCreated,
@@ -9,6 +10,8 @@ const SUBSCRIPTIONS = [
   Topics.InterviewScheduled,
   Topics.FollowupDue,
 ];
+
+const log = logger.child({ consumer: 'cache-invalidator' });
 
 export async function startCacheInvalidator(): Promise<Consumer> {
   const consumer = kafka.consumer({ groupId: 'cache-invalidator' });
@@ -24,11 +27,9 @@ export async function startCacheInvalidator(): Promise<Consumer> {
         const userId = envelope.actor?.userId;
         if (!userId) return;
         await del(dashboardCacheKey(userId));
-        // eslint-disable-next-line no-console
-        console.log(`[cache-invalidator] dropped dashboard:${userId} (${topic})`);
+        log.debug({ userId, topic }, 'dropped dashboard cache');
       } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error('[cache-invalidator] failed', err);
+        log.error({ err }, 'invalidator failed');
       }
     },
   });

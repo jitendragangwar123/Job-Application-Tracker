@@ -94,6 +94,7 @@ Steps are ordered so each builds on the last. Don't skip ahead — later steps a
 - Basic metrics (request count, latency, Kafka lag, cron last-run timestamp).
 - Error handling middleware that doesn't leak stack traces.
 
+
 ### Step 10 — Tests
 - Unit tests for auth, validation, cron logic.
 - Integration tests hitting real Postgres + Redis + Kafka via docker-compose.

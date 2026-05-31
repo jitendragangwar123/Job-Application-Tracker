@@ -5,6 +5,7 @@ import { redis } from './db/redis';
 import { ensureBucket } from './db/s3';
 import { startEvents, stopEvents } from './events';
 import { startCron, stopCron } from './jobs';
+import { logger } from './logger';
 
 async function main(): Promise<void> {
   await ensureBucket();
@@ -14,13 +15,11 @@ async function main(): Promise<void> {
   const app = createApp();
 
   const server = app.listen(env.port, () => {
-    // eslint-disable-next-line no-console
-    console.log(`[job-tracker] listening on :${env.port} (${env.nodeEnv})`);
+    logger.info({ port: env.port, env: env.nodeEnv }, 'http: listening');
   });
 
   async function shutdown(signal: string): Promise<void> {
-    // eslint-disable-next-line no-console
-    console.log(`[job-tracker] received ${signal}, shutting down`);
+    logger.info({ signal }, 'shutdown: received signal');
     server.close();
     stopCron();
     await stopEvents();
@@ -32,8 +31,17 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
+process.on('uncaughtException', (err) => {
+  logger.fatal({ err }, 'uncaughtException');
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  logger.fatal({ reason }, 'unhandledRejection');
+  process.exit(1);
+});
+
 main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error('[job-tracker] failed to start', err);
+  logger.fatal({ err }, 'failed to start');
   process.exit(1);
 });
